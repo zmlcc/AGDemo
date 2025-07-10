@@ -3,6 +3,7 @@ import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as F
+from einops import rearrange
 
 
 @dataclass
@@ -10,19 +11,39 @@ class ModelArgs:
     n_layers = 6
 
 
+
+# ein notation
+
+# b - batch
+# c - feature channel
+# s - sequence
+
+# data shape: (batch_size, num_channels, seq_len)
+
 class RMSBatchNorm(nn.Module):
-    def __init__(self, num_channels, eps=1e-05):
+    def __init__(self, num_channels, eps=1e-05, momentum=0.1):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(num_channels))
-        self.offset = nn.Parameter(torch.zeros(num_channels))
-
-    def _norm(self, x):
-        return x * torch.rsqrt(x.square().mean(0, keepdim=True) + self.eps)
+        self.momentum = momentum
+        self.gamma = nn.Parameter(torch.ones(num_channels))
+        self.beta = nn.Parameter(torch.zeros(num_channels))
+        self.register_buffer('running_var', torch.ones(num_channels))
 
     def forward(self, x):
-        output = self._norm(x)
-        return output * self.weight + self.offset
+        if self.training:
+            with torch.no_grad():
+                batch_var = torch.var(x, dim=(0, 2), unbiased=False)
+                self.running_var.lerp_(batch_var, self.momentum)
+        else:
+            batch_var = self.running_var
+
+        batch_std = batch_var.clamp(min=self.eps).sqrt()[None,:,None]
+        gamma = self.gamma[None,:,None]
+        beta = self.beta[None,:,None]
+
+        return x / batch_std * gamma + beta
+
+
 
 
 class StandardizedConv1D(nn.Conv1d):
