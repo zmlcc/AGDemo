@@ -26,23 +26,22 @@ class RMSBatchNorm(nn.Module):
         super().__init__()
         self.eps = eps
         self.momentum = momentum
-        self.gamma = nn.Parameter(torch.ones(num_channels))
-        self.beta = nn.Parameter(torch.zeros(num_channels))
-        self.register_buffer('running_var', torch.ones(num_channels))
+        para_shape = (1, num_channels, 1)  
+        self.gamma = nn.Parameter(torch.ones(para_shape))
+        self.beta = nn.Parameter(torch.zeros(para_shape))
+        self.register_buffer('var_ema', torch.ones(para_shape))
 
     def forward(self, x):
         if self.training:
             with torch.no_grad():
-                batch_var = torch.var(x, dim=(0, 2), unbiased=False)
-                self.running_var.lerp_(batch_var, self.momentum)
+                batch_ms = torch.mean(x.square(), dim=(0, 2), keepdim=True)
+                self.var_ema.lerp_(batch_ms, self.momentum)
         else:
-            batch_var = self.running_var
+            batch_ms = self.var_ema
 
-        batch_std = batch_var.clamp(min=self.eps).sqrt()[None,:,None]
-        gamma = self.gamma[None,:,None]
-        beta = self.beta[None,:,None]
+        batch_std = torch.sqrt(batch_ms + self.eps)
 
-        return x / batch_std * gamma + beta
+        return x / batch_std * self.gamma + self.beta
 
 
 class StandardizedWeight(nn.Module):
