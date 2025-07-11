@@ -4,13 +4,11 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from torch.nn.utils.parametrize import register_parametrization
-from einops import rearrange
 
 
 @dataclass
 class ModelArgs:
-    n_layers = 6
-
+    n_down_blocks = 6
 
 
 # ein notation
@@ -21,15 +19,16 @@ class ModelArgs:
 
 # data shape: (batch_size, num_channels, seq_len)
 
+
 class RMSBatchNorm(nn.Module):
     def __init__(self, num_channels, eps=1e-05, momentum=0.1):
         super().__init__()
         self.eps = eps
         self.momentum = momentum
-        para_shape = (1, num_channels, 1)  
+        para_shape = (1, num_channels, 1)
         self.gamma = nn.Parameter(torch.ones(para_shape))
         self.beta = nn.Parameter(torch.zeros(para_shape))
-        self.register_buffer('var_ema', torch.ones(para_shape))
+        self.register_buffer("var_ema", torch.ones(para_shape))
 
     def forward(self, x):
         if self.training:
@@ -54,19 +53,12 @@ class StandardizedWeight(nn.Module):
         scale = torch.rsqrt((var * fan_in).clamp(min=eps))
         return (weight - mean) * scale
 
+
 class StandardizedConv1D(nn.Conv1d):
-    def __init__(
-        self,
-        in_channels,
-        out_channels,
-        kernel_size,
-        *args,
-        **kwargs
-    ):
+    def __init__(self, in_channels, out_channels, kernel_size, *args, **kwargs):
         super().__init__(in_channels, out_channels, kernel_size, *args, **kwargs)
 
         register_parametrization(self, "weight", StandardizedWeight())
-
 
 
 class ConvBlock(nn.Module):
@@ -76,14 +68,11 @@ class ConvBlock(nn.Module):
         if kernel_size == 1:
             conv = nn.Linear(in_channels, out_channels)
         else:
-            conv = StandardizedConv1D(in_channels, out_channels, kernel_size, padding=kernel_size // 2)
-
-        self.net = nn.Sequential(
-            RMSBatchNorm(in_channels),
-            nn.GELU(),
-            conv
+            conv = StandardizedConv1D(
+                in_channels, out_channels, kernel_size, padding=kernel_size // 2
             )
 
+        self.net = nn.Sequential(RMSBatchNorm(in_channels), nn.GELU(), conv)
 
     def forward(self, x):
         return self.net(x)
@@ -92,13 +81,14 @@ class ConvBlock(nn.Module):
 class DnaEmbedder(nn.Module):
     def __init__(self):
         super().__init__()
-        self.conv0 = nn.Conv1d(4, 768, 15, padding=15//2)
+        self.conv0 = nn.Conv1d(4, 768, 15, padding=15 // 2)
         self.conv1 = ConvBlock(768, 768)
 
     def forward(self, x):
         out = self.conv0(x)
         return out + self.conv1(out)
-    
+
+
 class DownresBlock(nn.Module):
     def __init__(self, in_channels):
         super().__init__()
@@ -112,9 +102,20 @@ class DownresBlock(nn.Module):
         out = out + F.pad(x, (0, 0, 0, self.pad))
         return out + self.conv1(out)
 
+
 class SequenceEncoder(nn.Module):
     def __init__(self):
         super().__init__()
-        self.down1 = DownresBlock(768)
+        self.down_blocks = nn.ModuleList(
+            [DnaEmbedder()]
+            + [DownresBlock(768 + 128 * i) for i in range(1, ModelArgs.n_down_blocks)]
+        )
 
+    def forward(self, x):
+        self.intermediates = []
 
+        for block in self.down_blocks:
+            x = block(x)
+            self.intermediates.append(x)
+            # Maxpool
+        return x
