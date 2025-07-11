@@ -70,43 +70,30 @@ class StandardizedConv1D(nn.Conv1d):
 
 
 class ConvBlock(nn.Module):
-    def __init__(self, num_channels, width=5):
-        super().__init__()
-        self.num_channels = num_channels
-        self.width = width
-
-    def forward(self, x):
-        x = RMSBatchNorm(x.shape[-1])(x)
-        x = nn.GELU()(x)
-        if self.width == 1:
-            x = nn.Linear(x.shape[-1], self.num_channels)(x)
-        else:
-            x = StandardizedConv1D(x.shape[-1], self.num_channels, self.width)(x)
-        return x
-
-
-class ConvBlock222(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=5):
         super().__init__()
-        self.norm = RMSBatchNorm(in_channels)
-        self.actv = nn.GELU()
+
         if kernel_size == 1:
-            self.conv = nn.Linear(in_channels, out_channels)
+            conv = nn.Linear(in_channels, out_channels)
         else:
-            self.conv = StandardizedConv1D(in_channels, out_channels, kernel_size)
+            conv = StandardizedConv1D(in_channels, out_channels, kernel_size, padding=kernel_size // 2)
+
+        self.net = nn.Sequential(
+            RMSBatchNorm(in_channels),
+            nn.GELU(),
+            conv
+            )
+
 
     def forward(self, x):
-        x = self.norm(x)
-        x = self.actv(x)
-        x = self.conv(x)
-        return x
+        return self.net(x)
 
 
 class DnaEmbedder(nn.Module):
     def __init__(self):
         super().__init__()
-        self.conv0 = nn.Conv1d(4, 768, 15)
-        self.conv1 = ConvBlock222(768, 768, 15)
+        self.conv0 = nn.Conv1d(4, 768, 15, padding=15//2)
+        self.conv1 = ConvBlock(768, 768)
 
     def forward(self, x):
         out = self.conv0(x)
@@ -115,13 +102,14 @@ class DnaEmbedder(nn.Module):
 class DownresBlock(nn.Module):
     def __init__(self, in_channels):
         super().__init__()
-        out_channels = in_channels + 128
-        self.conv0 = ConvBlock222(in_channels, out_channels)
-        self.conv1 = ConvBlock222(out_channels, out_channels)
+        self.pad = 128
+        out_channels = in_channels + self.pad
+        self.conv0 = ConvBlock(in_channels, out_channels)
+        self.conv1 = ConvBlock(out_channels, out_channels)
 
     def forward(self, x):
         out = self.conv0(x)
-        out = out + Pad ???
+        out = out + F.pad(x, (0, 0, 0, self.pad))
         return out + self.conv1(out)
 
 class SequenceEncoder(nn.Module):
