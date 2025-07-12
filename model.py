@@ -17,7 +17,7 @@ class ModelArgs:
 # c - feature channel
 # s - sequence
 
-# data shape: (batch_size, num_channels, seq_len)
+# data shape: (batch_size, seq_len, num_channels)
 
 
 class RMSBatchNorm(nn.Module):
@@ -25,7 +25,7 @@ class RMSBatchNorm(nn.Module):
         super().__init__()
         self.eps = eps
         self.momentum = momentum
-        para_shape = (1, num_channels, 1)
+        para_shape = (1, 1, num_channels)
         self.gamma = nn.Parameter(torch.ones(para_shape))
         self.beta = nn.Parameter(torch.zeros(para_shape))
         self.register_buffer("var_ema", torch.ones(para_shape))
@@ -33,7 +33,7 @@ class RMSBatchNorm(nn.Module):
     def forward(self, x):
         if self.training:
             with torch.no_grad():
-                batch_ms = torch.mean(x.square(), dim=(0, 2), keepdim=True)
+                batch_ms = torch.mean(x.square(), dim=(0, 1), keepdim=True)
                 self.var_ema.lerp_(batch_ms, self.momentum)
         else:
             batch_ms = self.var_ema
@@ -54,7 +54,18 @@ class StandardizedWeight(nn.Module):
         return (weight - mean) * scale
 
 
-class StandardizedConv1D(nn.Conv1d):
+class Conv1D(nn.Conv1d):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def forward(self, x):
+        out = x.transpose(1, 2)  # (b, s, c) -> (b, c, s)
+        out = super().forward(out)
+        out.transpose_(1, 2)  # (b, c, s) -> (b, s, c)
+        return out
+
+
+class StandardizedConv1D(Conv1D):
     def __init__(self, in_channels, out_channels, kernel_size, *args, **kwargs):
         super().__init__(in_channels, out_channels, kernel_size, *args, **kwargs)
 
@@ -81,7 +92,7 @@ class ConvBlock(nn.Module):
 class DnaEmbedder(nn.Module):
     def __init__(self):
         super().__init__()
-        self.conv0 = nn.Conv1d(4, 768, 15, padding=15 // 2)
+        self.conv0 = Conv1D(4, 768, 15, padding=15 // 2)
         self.conv1 = ConvBlock(768, 768)
 
     def forward(self, x):
@@ -99,7 +110,7 @@ class DownresBlock(nn.Module):
 
     def forward(self, x):
         out = self.conv0(x)
-        out = out + F.pad(x, (0, 0, 0, self.pad))
+        out = out + F.pad(x, (0, self.pad))
         return out + self.conv1(out)
 
 
