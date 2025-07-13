@@ -5,8 +5,9 @@ from torch import nn
 import torch.nn.functional as F
 from torch.nn.utils.parametrize import register_parametrization
 
-from einops.layers.torch import Rearrange
+from einops.layers.torch import Rearrange, Reduce
 from einops import repeat, rearrange
+
 
 @dataclass
 class ModelArgs:
@@ -176,7 +177,10 @@ class RoPE(nn.Module):
         super().__init__()
         positions = positions or torch.arange(max_positions)
         num_freq = dim // 2
-        freqs = 1.0 / (torch.arange(num_freq) + torch.logspace(0, np.log10(max_positions - num_freq + 1), num_freq))
+        freqs = 1.0 / (
+            torch.arange(num_freq)
+            + torch.logspace(0, np.log10(max_positions - num_freq + 1), num_freq)
+        )
         theta = torch.outer(positions, freqs)
         theta = theta.repeat_interleave(2, dim=1)
         self.register_buffer("cos", theta.cos())
@@ -187,6 +191,7 @@ class RoPE(nn.Module):
         x_rotated = torch.cat([-x2, x1], dim=-1)
         return x * self.cos + x_rotated * self.sin
 
+
 class MhaBlock(nn.Module):
     def __init__(self, in_channels, seq_len):
         super().__init__()
@@ -195,7 +200,6 @@ class MhaBlock(nn.Module):
         q_channels = 128
         k_channels = 128
         v_channels = 192
-
 
         self.norm0 = RMSBatchNorm(in_channels)
 
@@ -222,14 +226,15 @@ class MhaBlock(nn.Module):
         self.liner1 = nn.Linear(in_channels, in_channels)
         self.norm1 = RMSBatchNorm(in_channels)
         self.dropout1 = nn.Dropout(0.3)
-        
 
     def forward(self, x, attn_bias):
         x_norm = self.norm0(x)
         q = self.q_proj(x_norm)
         k = self.k_proj(x_norm)
         v = self.v_proj(x_norm)
-        attn_logits = torch.einsum("b h s c, b 1 S c -> b h s S", q, k) / np.sqrt(k.shape[-1])
+        attn_logits = torch.einsum("b h s c, b 1 S c -> b h s S", q, k) / np.sqrt(
+            k.shape[-1]
+        )
         attn_logits = torch.tanh((attn_logits + attn_bias) / 5.0) * 5.0
         attn_weights = F.softmax(attn_logits, dim=-1)
         y = torch.einsum("b h s S, b 1 S c -> b h s c", attn_weights, v)
@@ -237,23 +242,102 @@ class MhaBlock(nn.Module):
         y = self.liner1(y)
         y = self.norm1(y)
         return self.dropout1(y)
-    
+
+
 class Sequence2PairBlock(nn.Module):
     def __init__(self, in_channels):
         super().__init__()
 
         pool_size = 16
-        out_channels = in_channels // pool_size
         qk_heads = 32
         qk_channels = 128
 
         self.downsample = nn.Sequential(
-            nn.AvgPool1d(pool_size),
-            RMSBatchNorm(out_channels)
+            Reduce("b (n p) c -> b p c", "mean", n=pool_size),  # (b, s, c) -> (b, p, c)
+            RMSBatchNorm(in_channels),
         )
 
-        self.q_proj = nn.Linear(out_channels, qk_heads * qk_channels, bias=False)
-        self.k_proj = nn.Linear(out_channels, qk_heads * qk_channels, bias=False)
+        self.q_proj = nn.Sequential(
+            nn.Linear(in_channels, qk_heads * qk_channels, bias=False),
+            Rearrange("b p (h c) -> b p h c", h=qk_heads, c=qk_channels),
+        )
+
+        self.k_proj = nn.Sequential(
+            nn.Linear(in_channels, qk_heads * qk_channels, bias=False),
+            Rearrange("b p (h c) -> b p h c", h=qk_heads, c=qk_channels),
+        )
+
+        pair_seq_len = 512
+        pair_fea_size = 64
+
+        pos_features = central_mask_features(pair_seq_len, pair_fea_size)
+        self.register_buffer("pos_features", pos_features)
+
+        self.to_pos = nn.Linear(pair_fea_size, qk_heads * qk_channels)
+
+        self.register_parameter(
+            "q_bias", nn.Parameter(torch.zeros(1, 1, qk_heads, qk_channels))
+        )
+        self.register_parameter(
+            "k_bias", nn.Parameter(torch.zeros(1, 1, qk_heads, qk_channels))
+        )
+
+        self.y_q_proj = nn.Sequential(
+            nn.GELU(),
+            nn.Linear(in_channels, qk_channels, bias=False),
+        )
+
+        self.y_k_proj = nn.Sequential(
+            nn.GELU(),
+            nn.Linear(in_channels, qk_channels, bias=False),
+        )
+
+        self.pair_proj = nn.Linear(qk_heads, qk_channels)
+
+        self.dropout = nn.Dropout(0.3)
 
     def forward(self, x):
         x = self.downsample(x)
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+
+        pos_encodings = self.to_pos(self.pos_features)
+
+        rel_q_a = relative_shift(
+            torch.einsum("b p h c, q h c -> b h p q", q + self.q_bias, pos_encodings)
+        )
+        rel_q_a = rearrange(rel_q_a, "b h p P -> b p P h")
+
+        rel_k_a = relative_shift(
+            torch.einsum("b p h c, q h c -> b h p q", k + self.k_bias, pos_encodings)
+        )
+        rel_k_a = rearrange(rel_k_a, "b h p P -> b P p h")
+
+        a = torch.einsum("b p h c, b P h c -> b p P h", q, k) + (rel_q_a + rel_k_a) / 2
+
+        y_q = self.y_q_proj(x)
+        y_k = self.y_k_proj(x)
+
+        pair_actvations = self.pair_proj(a) + y_q[:, :, None, :] + y_k[:, None, :, :]
+
+        return self.dropout(pair_actvations)
+
+
+def central_mask_features(sequence_length: int, feature_size: int):
+    relative_positions = torch.arange(2 * sequence_length - 1) - (sequence_length - 1)
+    center_widths = torch.arange(feature_size // 2) + np.geomspace(
+        1, sequence_length - feature_size // 2 + 1, feature_size // 2, endpoint=False
+    )
+    embeddings = center_widths[None, :] > torch.abs(relative_positions)[:, None]
+    return torch.cat(
+        [embeddings, torch.sign(relative_positions)[:, None] * embeddings], axis=-1
+    )
+
+
+# data shape: (...,  S,  2*S-1) -> (..., S, S)
+def relative_shift(x):
+    *batch_shapes, seq_length, num_diagonals = x.shape
+    x = F.pad(x, (1, 0))
+    x = x.reshape(batch_shapes + [num_diagonals + 1, seq_length])
+    x = x[..., 1:, :].reshape(batch_shapes + [seq_length, num_diagonals])
+    return x[..., :seq_length]
