@@ -341,3 +341,100 @@ def relative_shift(x):
     x = x.reshape(batch_shapes + [num_diagonals + 1, seq_length])
     x = x[..., 1:, :].reshape(batch_shapes + [seq_length, num_diagonals])
     return x[..., :seq_length]
+
+class RowAttentionBlock(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        self.norm = nn.RMSNorm(in_channels)
+        qkv_channels = 128
+        self.q_proj = nn.Linear(in_channels, qkv_channels, bias=False)
+        self.k_proj = nn.Linear(in_channels, qkv_channels, bias=False)
+        self.v_proj = nn.Linear(in_channels, qkv_channels)
+        self.dropout = nn.Dropout(0.3)
+
+    def forward(self, x):
+        x_norm = self.norm(x)
+        q = self.q_proj(x_norm)
+        k = self.k_proj(x_norm)
+        v = self.v_proj(x_norm)
+
+        attn_weights = torch.einsum("b p P f, b p k f -> b p P k", q, k) / np.sqrt(k.shape[-1])
+        attn_weights = F.softmax(attn_weights, dim=-1)
+
+        y = torch.einsum("b p P k, b p k f -> b p P f", attn_weights, v)
+        return self.dropout(y)
+    
+
+class PairMlpBlock(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        out_channels = in_channels * 2
+        dropout_rate = 0.3
+        self.net = nn.Sequential(
+            nn.RMSNorm(in_channels),
+            nn.Linear(in_channels, out_channels),
+            nn.ReLU(),
+            nn.Linear(out_channels, out_channels),
+            nn.Dropout(dropout_rate),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+    
+
+class PairUpdateBlock(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        pair_channels = 128
+        self.seq2pair = Sequence2PairBlock(in_channels)
+        self.row_attn = RowAttentionBlock(pair_channels)
+        self.pair_mlp = PairMlpBlock(pair_channels)
+
+    def forward(self, seq_input, pair_input):
+        y = self.seq2pair(seq_input)
+        x = y if pair_input is None else pair_input + y
+        x += self.row_attn(x)
+        x += self.pair_mlp(x)
+        return x
+        
+
+class TransformerTower(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        layer_depth = 9
+        pairwise_interval = 2
+        seq_len = 8192
+        pair_channels = 128
+        layers = []
+        for i in range(layer_depth):
+            if i % pairwise_interval == 0:
+                pair_update = PairUpdateBlock(in_channels)
+            else:
+                pair_update = None
+
+            mha = MhaBlock(in_channels, seq_len)
+            attn_bias = AttentionBiasBlock(pair_channels)
+            mlp = MlpBlock(in_channels)
+
+            layers.append(nn.ModuleList([
+                pair_update,
+                mha,
+                attn_bias,
+                mlp
+            ]))
+
+        self.layers = nn.ModuleList(layers)
+        
+
+    def forward(self, x):
+        pair_x = None
+        for (pair_update, mha, attn_bias, mlp) in self.layers:
+            if pair_update is not None:
+                pair_x = pair_update(x, pair_x)
+
+            x = x + mha(x, attn_bias(pair_x))
+            x = x + mlp(x)
+
+        return x, pair_x
+
+        
