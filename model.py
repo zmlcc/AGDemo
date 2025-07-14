@@ -1,4 +1,3 @@
-from dataclasses import dataclass
 import numpy as np
 import torch
 from torch import nn
@@ -7,12 +6,6 @@ from torch.nn.utils.parametrize import register_parametrization
 
 from einops.layers.torch import Rearrange, Reduce
 from einops import repeat, rearrange
-
-
-@dataclass
-class ModelArgs:
-    n_down_blocks = 6
-    n_up_blocks = 7
 
 
 # ein notation
@@ -53,7 +46,7 @@ class StandardizedWeight(nn.Module):
     # weight.shape: (out_channels, in_channels, kernel_size)
     def forward(self, weight):
         eps = 1e-4
-        fan_in = np.prod(weight.shape[1:])  # in_channels * kernel_size
+        fan_in = weight.shape[1:].numel()  # in_channels * kernel_size
         mean = torch.mean(weight, axis=[1, 2], keepdims=True)
         var = torch.var(weight, axis=[1, 2], keepdims=True)
         scale = torch.rsqrt((var * fan_in).clamp(min=eps))
@@ -78,7 +71,7 @@ class StandardizedConv1D(Conv1D):
         register_parametrization(self, "weight", StandardizedWeight())
 
 
-class ConvBlock(nn.Module):
+class cbConvBlock(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=5):
         super().__init__()
 
@@ -96,10 +89,10 @@ class ConvBlock(nn.Module):
 
 
 class DnaEmbedder(nn.Module):
-    def __init__(self):
+    def __init__(self, in_channels, out_channels):
         super().__init__()
-        self.conv0 = Conv1D(4, 768, 15, padding=15 // 2)
-        self.conv1 = ConvBlock(768, 768)
+        self.conv0 = Conv1D(in_channels, out_channels, 15, padding=15 // 2)
+        self.conv1 = ConvBlock(out_channels, out_channels)
 
     def forward(self, x):
         out = self.conv0(x)
@@ -107,10 +100,9 @@ class DnaEmbedder(nn.Module):
 
 
 class DownresBlock(nn.Module):
-    def __init__(self, in_channels):
+    def __init__(self, in_channels, out_channels):
         super().__init__()
-        self.pad = 128
-        out_channels = in_channels + self.pad
+        self.pad = out_channels - in_channels
         self.conv0 = ConvBlock(in_channels, out_channels)
         self.conv1 = ConvBlock(out_channels, out_channels)
 
@@ -121,21 +113,22 @@ class DownresBlock(nn.Module):
 
 
 class SequenceEncoder(nn.Module):
-    def __init__(self):
+    def __init__(self, base_channels, down_channels, n_down_blocks):
         super().__init__()
+        embedding_channels = down_channels[0]
         self.down_blocks = nn.ModuleList(
-            [DnaEmbedder()]
-            + [DownresBlock(768 + 128 * i) for i in range(1, ModelArgs.n_down_blocks)]
+            [DnaEmbedder(base_channels, embedding_channels)]
+            + [DownresBlock(down_channels[i], down_channels[i+1]) for i in range(n_down_blocks)]
         )
 
     def forward(self, x):
-        self.intermediates = []
+        intermediates = []
 
         for block in self.down_blocks:
             x = block(x)
-            self.intermediates.append(x)
+            intermediates.append(x)
             # Maxpool
-        return x
+        return x, intermediates
 
 
 class MlpBlock(nn.Module):
@@ -437,10 +430,9 @@ class TransformerTower(nn.Module):
 
 
 class UpresBlock(nn.Module):
-    def __init__(self, in_channels):
+    def __init__(self, in_channels, out_channels):
         super().__init__()
-        self.pad = 128
-        out_channels = in_channels - self.pad
+        self.pad = in_channels - out_channels
         self.conv0 = ConvBlock(in_channels, out_channels)
         nn.register_parameter(self, "residual_scale", torch.tensor(0.9))
         self.conv_unet = ConvBlock(out_channels, out_channels, 1)
@@ -454,10 +446,10 @@ class UpresBlock(nn.Module):
 
 
 class SequenceDecoder(nn.Module):
-    def __init__(self, in_channels):
+    def __init__(self, up_channels, n_up_blocks):
         super().__init__()
         self.up_blocks = nn.ModuleList(
-            [UpresBlock(in_channels - 128 * i) for i in range(ModelArgs.n_up_blocks)]
+            [UpresBlock(up_channels[i], up_channels[i+1]) for i in range(n_up_blocks)]
         )
 
     def forward(self, x, intermediates):
@@ -465,3 +457,17 @@ class SequenceDecoder(nn.Module):
             x = block(x, intermediates.pop())
 
         return x
+    
+
+class TransformerUnet(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.encoder = SequenceEncoder(config.base_channels, config.down_channels, config.n_down_blocks)
+        self.transformer = TransformerTower(config.transformer_channels)
+        self.decoder = SequenceDecoder(config.up_channels, config.n_up_blocks)
+
+    def forward(self, x):
+        x, intermediates = self.encoder(x)
+        x, pair_x = self.transformer(x)
+        x = self.decoder(x, intermediates[::-1])  # Reverse the order of intermediates
+        return x, pair_x
