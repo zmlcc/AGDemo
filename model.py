@@ -342,6 +342,7 @@ def relative_shift(x):
     x = x[..., 1:, :].reshape(batch_shapes + [seq_length, num_diagonals])
     return x[..., :seq_length]
 
+
 class RowAttentionBlock(nn.Module):
     def __init__(self, in_channels):
         super().__init__()
@@ -358,12 +359,14 @@ class RowAttentionBlock(nn.Module):
         k = self.k_proj(x_norm)
         v = self.v_proj(x_norm)
 
-        attn_weights = torch.einsum("b p P f, b p k f -> b p P k", q, k) / np.sqrt(k.shape[-1])
+        attn_weights = torch.einsum("b p P f, b p k f -> b p P k", q, k) / np.sqrt(
+            k.shape[-1]
+        )
         attn_weights = F.softmax(attn_weights, dim=-1)
 
         y = torch.einsum("b p P k, b p k f -> b p P f", attn_weights, v)
         return self.dropout(y)
-    
+
 
 class PairMlpBlock(nn.Module):
     def __init__(self, in_channels):
@@ -380,7 +383,7 @@ class PairMlpBlock(nn.Module):
 
     def forward(self, x):
         return self.net(x)
-    
+
 
 class PairUpdateBlock(nn.Module):
     def __init__(self, in_channels):
@@ -396,7 +399,7 @@ class PairUpdateBlock(nn.Module):
         x += self.row_attn(x)
         x += self.pair_mlp(x)
         return x
-        
+
 
 class TransformerTower(nn.Module):
     def __init__(self, in_channels):
@@ -416,19 +419,13 @@ class TransformerTower(nn.Module):
             attn_bias = AttentionBiasBlock(pair_channels)
             mlp = MlpBlock(in_channels)
 
-            layers.append(nn.ModuleList([
-                pair_update,
-                mha,
-                attn_bias,
-                mlp
-            ]))
+            layers.append(nn.ModuleList([pair_update, mha, attn_bias, mlp]))
 
         self.layers = nn.ModuleList(layers)
-        
 
     def forward(self, x):
         pair_x = None
-        for (pair_update, mha, attn_bias, mlp) in self.layers:
+        for pair_update, mha, attn_bias, mlp in self.layers:
             if pair_update is not None:
                 pair_x = pair_update(x, pair_x)
 
@@ -437,4 +434,19 @@ class TransformerTower(nn.Module):
 
         return x, pair_x
 
-        
+
+class UpresBlock(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        self.pad = 128
+        out_channels = in_channels - self.pad
+        self.conv0 = ConvBlock(in_channels, out_channels)
+        nn.register_parameter(self, "residual_scale", torch.tensor(0.9))
+        self.conv_unet = ConvBlock(out_channels, out_channels, 1)
+        self.conv1 = ConvBlock(out_channels, out_channels)
+
+    def forward(self, x, unet_skip):
+        out = self.conv0(x) + x[..., : -self.pad]
+        out = repeat(out, "b s c -> b (s 2) c") * self.residual_scale
+        out += self.conv_unet(unet_skip)
+        return out + self.conv1(out)
