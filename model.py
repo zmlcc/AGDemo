@@ -12,6 +12,7 @@ from einops import repeat, rearrange
 @dataclass
 class ModelArgs:
     n_down_blocks = 6
+    n_up_blocks = 7
 
 
 # ein notation
@@ -450,3 +451,17 @@ class UpresBlock(nn.Module):
         out = repeat(out, "b s c -> b (s 2) c") * self.residual_scale
         out += self.conv_unet(unet_skip)
         return out + self.conv1(out)
+
+
+class SequenceDecoder(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        self.up_blocks = nn.ModuleList(
+            [UpresBlock(in_channels - 128 * i) for i in range(ModelArgs.n_up_blocks)]
+        )
+
+    def forward(self, x, intermediates):
+        for block in self.up_blocks:
+            x = block(x, intermediates.pop())
+
+        return x
