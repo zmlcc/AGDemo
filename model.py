@@ -118,7 +118,10 @@ class SequenceEncoder(nn.Module):
         embedding_channels = down_channels[0]
         self.down_blocks = nn.ModuleList(
             [DnaEmbedder(base_channels, embedding_channels)]
-            + [DownresBlock(down_channels[i], down_channels[i+1]) for i in range(n_down_blocks)]
+            + [
+                DownresBlock(down_channels[i], down_channels[i + 1])
+                for i in range(n_down_blocks)
+            ]
         )
 
     def forward(self, x):
@@ -127,7 +130,9 @@ class SequenceEncoder(nn.Module):
         for block in self.down_blocks:
             x = block(x)
             intermediates.append(x)
-            x = reduce(x, "b (s pool) c -> b s c", "max", pool=2)  # Downsample by factor of 2
+            x = reduce(
+                x, "b (s pool) c -> b s c", "max", pool=2
+            )  # Downsample by factor of 2
         return x, intermediates
 
 
@@ -177,6 +182,7 @@ class RoPE(nn.Module):
         )
         theta = torch.outer(positions, freqs)
         theta = theta.repeat_interleave(2, dim=1)
+        print("Theta SHAPE:", theta.shape)
         self.register_buffer("cos", theta.cos())
         self.register_buffer("sin", theta.sin())
 
@@ -187,7 +193,7 @@ class RoPE(nn.Module):
 
 
 class MhaBlock(nn.Module):
-    def __init__(self, in_channels, seq_len):
+    def __init__(self, in_channels, pos_embedding):
         super().__init__()
         q_heads = 8
         kv_heads = 1
@@ -201,14 +207,14 @@ class MhaBlock(nn.Module):
             nn.Linear(in_channels, q_heads * q_channels, bias=False),
             Rearrange("b s (h c) -> b h s c", h=q_heads, c=q_channels),
             nn.LayerNorm(q_channels),
-            RoPE(q_channels, seq_len),
+            pos_embedding,
         )
 
         self.k_proj = nn.Sequential(
             nn.Linear(in_channels, kv_heads * k_channels, bias=False),
             Rearrange("b s (h c) -> b h s c", h=kv_heads, c=k_channels),
             nn.LayerNorm(k_channels),
-            RoPE(k_channels, seq_len),
+            pos_embedding,
         )
 
         self.v_proj = nn.Sequential(
@@ -226,11 +232,13 @@ class MhaBlock(nn.Module):
         q = self.q_proj(x_norm)
         k = self.k_proj(x_norm)
         v = self.v_proj(x_norm)
+        print("Q SHAPE:", q.shape, "K SHAPE:", k.shape, "V SHAPE:", v.shape)
         attn_logits = torch.einsum("b h s c, b 1 S c -> b h s S", q, k) / np.sqrt(
             k.shape[-1]
         )
         attn_logits = torch.tanh((attn_logits + attn_bias) / 5.0) * 5.0
         attn_weights = F.softmax(attn_logits, dim=-1)
+        print("ATTN WEIGHTS SHAPE:", attn_weights.shape)
         y = torch.einsum("b h s S, b 1 S c -> b h s c", attn_weights, v)
         y = rearrange(y, "b h s c -> b s (h c)")
         y = self.liner1(y)
@@ -267,7 +275,10 @@ class Sequence2PairBlock(nn.Module):
         pos_features = central_mask_features(pair_seq_len, pair_fea_size)
         self.register_buffer("pos_features", pos_features)
 
-        self.to_pos = nn.Linear(pair_fea_size, qk_heads * qk_channels)
+        self.to_pos = nn.Sequential(
+            nn.Linear(pair_fea_size, qk_heads * qk_channels),
+            Rearrange("q (h c) -> q h c", h=qk_heads, c=qk_channels),
+        )
 
         self.register_parameter(
             "q_bias", nn.Parameter(torch.zeros(1, 1, qk_heads, qk_channels))
@@ -318,9 +329,16 @@ class Sequence2PairBlock(nn.Module):
 
 
 def central_mask_features(sequence_length: int, feature_size: int):
-    relative_positions = torch.arange(2 * sequence_length - 1) - (sequence_length - 1)
-    center_widths = torch.arange(feature_size // 2) + np.geomspace(
-        1, sequence_length - feature_size // 2 + 1, feature_size // 2, endpoint=False
+    relative_positions = torch.arange(2 * sequence_length - 1, dtype=torch.float32) - (
+        sequence_length - 1
+    )
+    center_widths = torch.arange(feature_size // 2, dtype=torch.float32) + torch.tensor(
+        np.geomspace(
+            1,
+            sequence_length - feature_size // 2 + 1,
+            feature_size // 2,
+            endpoint=False,
+        )
     )
     embeddings = center_widths[None, :] > torch.abs(relative_positions)[:, None]
     return torch.cat(
@@ -371,7 +389,7 @@ class PairMlpBlock(nn.Module):
             nn.RMSNorm(in_channels),
             nn.Linear(in_channels, out_channels),
             nn.ReLU(),
-            nn.Linear(out_channels, out_channels),
+            nn.Linear(out_channels, in_channels),
             nn.Dropout(dropout_rate),
         )
 
@@ -400,16 +418,21 @@ class TransformerTower(nn.Module):
         super().__init__()
         layer_depth = 9
         pairwise_interval = 2
-        seq_len = 8192
+        max_pos = 32
         pair_channels = 128
         layers = []
+
+        qk_channels = 128
+
+        rope = RoPE(qk_channels, max_pos)
+
         for i in range(layer_depth):
             if i % pairwise_interval == 0:
                 pair_update = PairUpdateBlock(in_channels)
             else:
                 pair_update = None
 
-            mha = MhaBlock(in_channels, seq_len)
+            mha = MhaBlock(in_channels, rope)
             attn_bias = AttentionBiasBlock(pair_channels)
             mlp = MlpBlock(in_channels)
 
@@ -449,7 +472,7 @@ class SequenceDecoder(nn.Module):
     def __init__(self, up_channels, n_up_blocks):
         super().__init__()
         self.up_blocks = nn.ModuleList(
-            [UpresBlock(up_channels[i], up_channels[i+1]) for i in range(n_up_blocks)]
+            [UpresBlock(up_channels[i], up_channels[i + 1]) for i in range(n_up_blocks)]
         )
 
     def forward(self, x, intermediates):
@@ -457,12 +480,14 @@ class SequenceDecoder(nn.Module):
             x = block(x, intermediates.pop())
 
         return x
-    
+
 
 class TransformerUnet(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.encoder = SequenceEncoder(config.base_channels, config.down_channels, config.n_down_blocks)
+        self.encoder = SequenceEncoder(
+            config.base_channels, config.down_channels, config.n_down_blocks
+        )
         self.transformer = TransformerTower(config.transformer_channels)
         self.decoder = SequenceDecoder(config.up_channels, config.n_up_blocks)
 
