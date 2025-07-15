@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from torch.nn.utils.parametrize import register_parametrization
 
 from einops.layers.torch import Rearrange, Reduce
-from einops import repeat, rearrange
+from einops import repeat, rearrange, reduce
 
 
 # ein notation
@@ -31,7 +31,7 @@ class RMSBatchNorm(nn.Module):
     def forward(self, x):
         if self.training:
             with torch.no_grad():
-                x_reshaped = x.view(-1, x.shape[-1])
+                x_reshaped = x.reshape(-1, x.shape[-1])
                 batch_ms = torch.mean(x_reshaped.square(), dim=0)
                 self.var_ema.lerp_(batch_ms, self.momentum)
         else:
@@ -71,7 +71,7 @@ class StandardizedConv1D(Conv1D):
         register_parametrization(self, "weight", StandardizedWeight())
 
 
-class cbConvBlock(nn.Module):
+class ConvBlock(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=5):
         super().__init__()
 
@@ -127,7 +127,7 @@ class SequenceEncoder(nn.Module):
         for block in self.down_blocks:
             x = block(x)
             intermediates.append(x)
-            # Maxpool
+            x = reduce(x, "b (s pool) c -> b s c", "max", pool=2)  # Downsample by factor of 2
         return x, intermediates
 
 
@@ -432,14 +432,14 @@ class TransformerTower(nn.Module):
 class UpresBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
-        self.pad = in_channels - out_channels
+        self.out_channels = out_channels
         self.conv0 = ConvBlock(in_channels, out_channels)
-        nn.register_parameter(self, "residual_scale", torch.tensor(0.9))
+        self.register_parameter("residual_scale", nn.Parameter(torch.tensor(0.9)))
         self.conv_unet = ConvBlock(out_channels, out_channels, 1)
         self.conv1 = ConvBlock(out_channels, out_channels)
 
     def forward(self, x, unet_skip):
-        out = self.conv0(x) + x[..., : -self.pad]
+        out = self.conv0(x) + x[..., : self.out_channels]
         out = repeat(out, "b s c -> b (s 2) c") * self.residual_scale
         out += self.conv_unet(unet_skip)
         return out + self.conv1(out)
@@ -469,5 +469,5 @@ class TransformerUnet(nn.Module):
     def forward(self, x):
         x, intermediates = self.encoder(x)
         x, pair_x = self.transformer(x)
-        x = self.decoder(x, intermediates[::-1])  # Reverse the order of intermediates
+        x = self.decoder(x, intermediates)
         return x, pair_x

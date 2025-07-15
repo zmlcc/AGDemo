@@ -33,4 +33,4 @@ class AGConfig:
             for i in range(self.n_down_blocks)
         ] + [self.transformer_channels]
 
-        self.up_channels = [self.transformer_channels] + [self.down_channels][::-1]
+        self.up_channels = [self.transformer_channels] + self.down_channels[::-1]
