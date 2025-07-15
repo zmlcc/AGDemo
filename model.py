@@ -146,8 +146,8 @@ class MlpBlock(nn.Module):
             nn.Linear(in_channels, out_channels),
             nn.ReLU(),
             nn.Dropout(dropout_rate),
-            nn.Linear(out_channels, out_channels),
-            RMSBatchNorm(out_channels),
+            nn.Linear(out_channels, in_channels),
+            RMSBatchNorm(in_channels),
             nn.Dropout(dropout_rate),
         )
 
@@ -168,21 +168,24 @@ class AttentionBiasBlock(nn.Module):
     # data shape: (b p P f) -> (b 8 s S)
     def forward(self, x):
         out = self.net(x)
-        return repeat(out, "b h p P -> b h (p 8) (P 8)")
+        return repeat(out, "b h p P -> b h (p 16) (P 16)")
 
 
 class RoPE(nn.Module):
-    def __init__(self, dim, max_positions, positions=None):
+    def __init__(self, dim, max_position, positions=None):
         super().__init__()
-        positions = positions or torch.arange(max_positions)
+        positions = positions if positions is not None else torch.arange(max_position, dtype=torch.float32)
         num_freq = dim // 2
+        assert(max_position >= num_freq)
+
         freqs = 1.0 / (
-            torch.arange(num_freq)
-            + torch.logspace(0, np.log10(max_positions - num_freq + 1), num_freq)
+            torch.arange(num_freq, dtype=torch.float32)
+            + torch.tensor(np.geomspace(1, max_position - num_freq + 1, num_freq), dtype=torch.float32)
         )
+
         theta = torch.outer(positions, freqs)
         theta = theta.repeat_interleave(2, dim=1)
-        print("Theta SHAPE:", theta.shape)
+
         self.register_buffer("cos", theta.cos())
         self.register_buffer("sin", theta.sin())
 
@@ -193,33 +196,26 @@ class RoPE(nn.Module):
 
 
 class MhaBlock(nn.Module):
-    def __init__(self, in_channels, pos_embedding):
+    def __init__(self, in_channels, q_heads, qk_channels,v_channels, pos_embedding):
         super().__init__()
-        q_heads = 8
-        kv_heads = 1
-        q_channels = 128
-        k_channels = 128
-        v_channels = 192
 
         self.norm0 = RMSBatchNorm(in_channels)
 
         self.q_proj = nn.Sequential(
-            nn.Linear(in_channels, q_heads * q_channels, bias=False),
-            Rearrange("b s (h c) -> b h s c", h=q_heads, c=q_channels),
-            nn.LayerNorm(q_channels),
+            nn.Linear(in_channels, q_heads * qk_channels, bias=False),
+            Rearrange("b s (h c) -> b h s c", h=q_heads, c=qk_channels),
+            nn.LayerNorm(qk_channels),
             pos_embedding,
         )
 
         self.k_proj = nn.Sequential(
-            nn.Linear(in_channels, kv_heads * k_channels, bias=False),
-            Rearrange("b s (h c) -> b h s c", h=kv_heads, c=k_channels),
-            nn.LayerNorm(k_channels),
+            nn.Linear(in_channels,  qk_channels, bias=False),
+            nn.LayerNorm(qk_channels),
             pos_embedding,
         )
 
         self.v_proj = nn.Sequential(
-            nn.Linear(in_channels, kv_heads * v_channels, bias=False),
-            Rearrange("b s (h c) -> b h s c", h=kv_heads, c=v_channels),
+            nn.Linear(in_channels,  v_channels, bias=False),
             nn.LayerNorm(v_channels),
         )
 
@@ -232,14 +228,12 @@ class MhaBlock(nn.Module):
         q = self.q_proj(x_norm)
         k = self.k_proj(x_norm)
         v = self.v_proj(x_norm)
-        print("Q SHAPE:", q.shape, "K SHAPE:", k.shape, "V SHAPE:", v.shape)
-        attn_logits = torch.einsum("b h s c, b 1 S c -> b h s S", q, k) / np.sqrt(
+        attn_logits = torch.einsum("b h s c, b S c -> b h s S", q, k) / np.sqrt(
             k.shape[-1]
         )
         attn_logits = torch.tanh((attn_logits + attn_bias) / 5.0) * 5.0
         attn_weights = F.softmax(attn_logits, dim=-1)
-        print("ATTN WEIGHTS SHAPE:", attn_weights.shape)
-        y = torch.einsum("b h s S, b 1 S c -> b h s c", attn_weights, v)
+        y = torch.einsum("b h s S, b S c -> b h s c", attn_weights, v)
         y = rearrange(y, "b h s c -> b s (h c)")
         y = self.liner1(y)
         y = self.norm1(y)
@@ -247,12 +241,10 @@ class MhaBlock(nn.Module):
 
 
 class Sequence2PairBlock(nn.Module):
-    def __init__(self, in_channels):
+    def __init__(self, in_channels, pool_size, qk_heads, qk_channels, pos_features):
         super().__init__()
 
-        pool_size = 16
-        qk_heads = 32
-        qk_channels = 128
+        assert in_channels % pool_size == 0, "in_channels must be divisible by pool_size"
 
         self.downsample = nn.Sequential(
             Reduce("b (n p) c -> b p c", "mean", n=pool_size),  # (b, s, c) -> (b, p, c)
@@ -269,14 +261,10 @@ class Sequence2PairBlock(nn.Module):
             Rearrange("b p (h c) -> b p h c", h=qk_heads, c=qk_channels),
         )
 
-        pair_seq_len = 512
-        pair_fea_size = 64
-
-        pos_features = central_mask_features(pair_seq_len, pair_fea_size)
         self.register_buffer("pos_features", pos_features)
 
-        self.to_pos = nn.Sequential(
-            nn.Linear(pair_fea_size, qk_heads * qk_channels),
+        self.pos_proj = nn.Sequential(
+            nn.Linear(pos_features.shape[-1], qk_heads * qk_channels),
             Rearrange("q (h c) -> q h c", h=qk_heads, c=qk_channels),
         )
 
@@ -306,15 +294,15 @@ class Sequence2PairBlock(nn.Module):
         q = self.q_proj(x)
         k = self.k_proj(x)
 
-        pos_encodings = self.to_pos(self.pos_features)
+        pos_encoding = self.pos_proj(self.pos_features)
 
         rel_q_a = relative_shift(
-            torch.einsum("b p h c, q h c -> b h p q", q + self.q_bias, pos_encodings)
+            torch.einsum("b p h c, q h c -> b h p q", q + self.q_bias, pos_encoding)
         )
         rel_q_a = rearrange(rel_q_a, "b h p P -> b p P h")
 
         rel_k_a = relative_shift(
-            torch.einsum("b p h c, q h c -> b h p q", k + self.k_bias, pos_encodings)
+            torch.einsum("b p h c, q h c -> b h p q", k + self.k_bias, pos_encoding)
         )
         rel_k_a = rearrange(rel_k_a, "b h p P -> b P p h")
 
@@ -338,7 +326,7 @@ def central_mask_features(sequence_length: int, feature_size: int):
             sequence_length - feature_size // 2 + 1,
             feature_size // 2,
             endpoint=False,
-        )
+        ), dtype=torch.float32
     )
     embeddings = center_widths[None, :] > torch.abs(relative_positions)[:, None]
     return torch.cat(
@@ -398,12 +386,12 @@ class PairMlpBlock(nn.Module):
 
 
 class PairUpdateBlock(nn.Module):
-    def __init__(self, in_channels):
+    def __init__(self, in_channels, pool_size, qk_heads, qk_channels, pair_pos_features):
         super().__init__()
-        pair_channels = 128
-        self.seq2pair = Sequence2PairBlock(in_channels)
-        self.row_attn = RowAttentionBlock(pair_channels)
-        self.pair_mlp = PairMlpBlock(pair_channels)
+
+        self.seq2pair = Sequence2PairBlock(in_channels, pool_size, qk_heads, qk_channels, pair_pos_features)
+        self.row_attn = RowAttentionBlock(qk_channels)
+        self.pair_mlp = PairMlpBlock(qk_channels)
 
     def forward(self, seq_input, pair_input):
         y = self.seq2pair(seq_input)
@@ -414,26 +402,41 @@ class PairUpdateBlock(nn.Module):
 
 
 class TransformerTower(nn.Module):
-    def __init__(self, in_channels):
+    def __init__(self, config):
         super().__init__()
-        layer_depth = 9
-        pairwise_interval = 2
-        max_pos = 32
-        pair_channels = 128
+
+        in_channels = config.transformer_channels
+        
+        n_transformer_blocks = config.n_transformer_blocks
+        q_heads = config.q_heads
+        qk_channels = config.qk_channels
+        v_channels = config.v_channels
+        max_position = config.max_position
+        single_seq_len = config.single_seq_len
+
+        pair_block_gap = config.pair_block_gap
+        pair_pool_size = config.pair_pool_size
+        pair_seq_len = config.pair_seq_len
+        pair_pos_feat_size = config.pair_pos_feat_size
+        pair_qk_heads = config.pair_qk_heads
+        pair_qk_channels = config.pair_qk_channels
+
+        
         layers = []
 
-        qk_channels = 128
+        positions = torch.arange(single_seq_len, dtype=torch.float32)
+        rope = RoPE(qk_channels, max_position, positions)
 
-        rope = RoPE(qk_channels, max_pos)
+        pair_pos_features = central_mask_features(pair_seq_len, pair_pos_feat_size)
 
-        for i in range(layer_depth):
-            if i % pairwise_interval == 0:
-                pair_update = PairUpdateBlock(in_channels)
+        for i in range(n_transformer_blocks):
+            if i % pair_block_gap == 0:
+                pair_update = PairUpdateBlock(in_channels, pair_pool_size, pair_qk_heads, pair_qk_channels, pair_pos_features)
             else:
                 pair_update = None
 
-            mha = MhaBlock(in_channels, rope)
-            attn_bias = AttentionBiasBlock(pair_channels)
+            mha = MhaBlock(in_channels, q_heads, qk_channels, v_channels, rope)
+            attn_bias = AttentionBiasBlock(pair_qk_channels)
             mlp = MlpBlock(in_channels)
 
             layers.append(nn.ModuleList([pair_update, mha, attn_bias, mlp]))
@@ -488,7 +491,7 @@ class TransformerUnet(nn.Module):
         self.encoder = SequenceEncoder(
             config.base_channels, config.down_channels, config.n_down_blocks
         )
-        self.transformer = TransformerTower(config.transformer_channels)
+        self.transformer = TransformerTower(config)
         self.decoder = SequenceDecoder(config.up_channels, config.n_up_blocks)
 
     def forward(self, x):
